@@ -4,6 +4,11 @@
 # This source code is licensed under the license found in the
 # LICENSE file in the root directory of this source tree.
 
+# Adapted from:
+# SAM2Export repository by Aimol-l
+# Original file: https://github.com/Aimol-l/SAM2Export/blob/main/sam2/modeling/sam/transformer.py
+# For more info, check issue: https://github.com/facebookresearch/sam2/issues/284
+
 import math
 from functools import partial
 from typing import Tuple, Type
