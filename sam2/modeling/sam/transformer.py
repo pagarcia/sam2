@@ -9,7 +9,9 @@
 # Original file: https://github.com/Aimol-l/SAM2Export/blob/main/sam2/modeling/sam/transformer.py
 # For more info, check issue: https://github.com/facebookresearch/sam2/issues/284
 
+import contextlib
 import math
+import warnings
 from functools import partial
 from typing import Tuple, Type
 
@@ -17,8 +19,39 @@ import torch
 import torch.nn.functional as F
 from torch import nn, Tensor
 
-from sam2.modeling.position_encoding import apply_rotary_enc, compute_axial_cis
+# Make sure these imports exist in your repo:
+from sam2.modeling.position_encoding import (
+    apply_rotary_enc,
+    apply_rotary_matenc,
+    compute_axial_cis,
+    get_rotation_matrices,
+)
 from sam2.modeling.sam2_utils import MLP
+from sam2.utils.misc import get_sdpa_settings
+
+warnings.simplefilter(action="ignore", category=FutureWarning)
+
+# --- FLASH ATTENTION FALLBACK LOGIC ---
+OLD_GPU, USE_FLASH_ATTN, MATH_KERNEL_ON = get_sdpa_settings()
+ALLOW_ALL_KERNELS = False
+
+def sdp_kernel_context(dropout_p: float):
+    """
+    Decide whether we use FlashAttention / Mem-Eff / Math kernel, and
+    gracefully fall back if something fails.
+    """
+    if ALLOW_ALL_KERNELS:
+        # If we've already fallen back, just allow all kernels now
+        return contextlib.nullcontext()
+
+    return torch.backends.cuda.sdp_kernel(
+        enable_flash=USE_FLASH_ATTN,
+        enable_math=(OLD_GPU and dropout_p > 0.0) or MATH_KERNEL_ON,
+        enable_mem_efficient=OLD_GPU,
+    )
+
+# Optionally, if you want matrix-based RoPE
+USE_MAT_ROTARY_ENC = True
 
 
 class TwoWayTransformer(nn.Module):
@@ -75,36 +108,31 @@ class TwoWayTransformer(nn.Module):
     ) -> Tuple[Tensor, Tensor]:
         """
         Args:
-          image_embedding (torch.Tensor): image to attend to. Should be shape
-            B x embedding_dim x h x w for any h and w.
-          image_pe (torch.Tensor): the positional encoding to add to the image. Must
-            have the same shape as image_embedding.
-          point_embedding (torch.Tensor): the embedding to add to the query points.
-            Must have shape B x N_points x embedding_dim for any N_points.
+          image_embedding (torch.Tensor): shape (B, C, H, W)
+          image_pe (torch.Tensor): shape (B, C, H, W), same as image_embedding
+          point_embedding (torch.Tensor): shape (B, N_points, C)
 
         Returns:
-          torch.Tensor: the processed point_embedding
-          torch.Tensor: the processed image_embedding
+          point_embedding_out, image_embedding_out
         """
-        # BxCxHxW -> BxHWxC == B x N_image_tokens x C
-        bs, c, h, w = image_embedding.shape
-        image_embedding = image_embedding.flatten(2).permute(0, 2, 1)
-        image_pe = image_pe.flatten(2).permute(0, 2, 1)
+        # Flatten the image to B x (HW) x C
+        B, C, H, W = image_embedding.shape
+        image_embedding = image_embedding.flatten(2).permute(0, 2, 1)  # (B, HW, C)
+        image_pe = image_pe.flatten(2).permute(0, 2, 1)                # (B, HW, C)
 
-        # Prepare queries
-        queries = point_embedding
-        keys = image_embedding
+        queries = point_embedding  # (B, N_pts, C)
+        keys = image_embedding     # (B, HW,   C)
 
-        # Apply transformer blocks and final layernorm
+        # Run each transformer block
         for layer in self.layers:
             queries, keys = layer(
                 queries=queries,
                 keys=keys,
-                query_pe=point_embedding,
-                key_pe=image_pe,
+                query_pe=point_embedding,  # The "point" embedding as positional
+                key_pe=image_pe,          # The "image" positional embedding
             )
 
-        # Apply the final attention layer from the points to the image
+        # Final attention from points -> image
         q = queries + point_embedding
         k = keys + image_pe
         attn_out = self.final_attn_token_to_image(q=q, k=k, v=keys)
@@ -115,6 +143,13 @@ class TwoWayTransformer(nn.Module):
 
 
 class TwoWayAttentionBlock(nn.Module):
+    """
+    A block with:
+      1) Self-attn on the sparse queries
+      2) Cross-attn (sparse->dense)
+      3) MLP on queries
+      4) Cross-attn (dense->sparse).
+    """
     def __init__(
         self,
         embedding_dim: int,
@@ -124,19 +159,6 @@ class TwoWayAttentionBlock(nn.Module):
         attention_downsample_rate: int = 2,
         skip_first_layer_pe: bool = False,
     ) -> None:
-        """
-        A transformer block with four layers: (1) self-attention of sparse
-        inputs, (2) cross attention of sparse inputs to dense inputs, (3) mlp
-        block on sparse inputs, and (4) cross attention of dense inputs to sparse
-        inputs.
-
-        Arguments:
-          embedding_dim (int): the channel dimension of the embeddings
-          num_heads (int): the number of heads in the attention layers
-          mlp_dim (int): the hidden dimension of the mlp block
-          activation (nn.Module): the activation of the mlp block
-          skip_first_layer_pe (bool): skip the PE on the first layer
-        """
         super().__init__()
         self.self_attn = Attention(embedding_dim, num_heads)
         self.norm1 = nn.LayerNorm(embedding_dim)
@@ -159,10 +181,15 @@ class TwoWayAttentionBlock(nn.Module):
         self.skip_first_layer_pe = skip_first_layer_pe
 
     def forward(
-        self, queries: Tensor, keys: Tensor, query_pe: Tensor, key_pe: Tensor
+        self,
+        queries: Tensor,
+        keys: Tensor,
+        query_pe: Tensor,
+        key_pe: Tensor
     ) -> Tuple[Tensor, Tensor]:
-        # Self attention block
+        # (1) Self attention on queries
         if self.skip_first_layer_pe:
+            # No positional encoding added if skip_first_layer_pe
             queries = self.self_attn(q=queries, k=queries, v=queries)
         else:
             q = queries + query_pe
@@ -170,19 +197,19 @@ class TwoWayAttentionBlock(nn.Module):
             queries = queries + attn_out
         queries = self.norm1(queries)
 
-        # Cross attention block, tokens attending to image embedding
+        # (2) Cross attention: tokens -> image
         q = queries + query_pe
         k = keys + key_pe
         attn_out = self.cross_attn_token_to_image(q=q, k=k, v=keys)
         queries = queries + attn_out
         queries = self.norm2(queries)
 
-        # MLP block
+        # (3) MLP block
         mlp_out = self.mlp(queries)
         queries = queries + mlp_out
         queries = self.norm3(queries)
 
-        # Cross attention block, image embedding attending to tokens
+        # (4) Cross attention: image -> tokens
         q = queries + query_pe
         k = keys + key_pe
         attn_out = self.cross_attn_image_to_token(q=k, k=q, v=queries)
@@ -194,10 +221,10 @@ class TwoWayAttentionBlock(nn.Module):
 
 class Attention(nn.Module):
     """
-    An attention layer that allows for downscaling the size of the embedding
-    after projection to queries, keys, and values.
+    A basic multi-head attention layer, with optional downsample on Q/K/V.
+    We also add a fallback logic for scaled_dot_product_attention if
+    Flash Attention fails or is not available.
     """
-
     def __init__(
         self,
         embedding_dim: int,
@@ -223,94 +250,148 @@ class Attention(nn.Module):
         self.dropout_p = dropout
 
     def _separate_heads(self, x: Tensor, num_heads: int) -> Tensor:
-        b, n, c = x.shape
+        b, n, c = x.shape  # (Batch, Tokens, Channels)
         x = x.reshape(b, n, num_heads, c // num_heads)
-        return x.transpose(1, 2)  # B x N_heads x N_tokens x C_per_head
+        # => (B, N, N_heads, C_per_head)
+        return x.transpose(1, 2)  # => (B, N_heads, N, C_per_head)
 
     def _recombine_heads(self, x: Tensor) -> Tensor:
         b, n_heads, n_tokens, c_per_head = x.shape
-        x = x.transpose(1, 2)
-        return x.reshape(b, n_tokens, n_heads * c_per_head)  # B x N_tokens x C
+        x = x.transpose(1, 2)  # => (B, N, N_heads, C_per_head)
+        return x.reshape(b, n_tokens, n_heads * c_per_head)
 
     def forward(self, q: Tensor, k: Tensor, v: Tensor) -> Tensor:
-        # Input projections
+        # 1) project Q, K, V
         q = self.q_proj(q)
         k = self.k_proj(k)
         v = self.v_proj(v)
 
-        # Separate into heads
+        # 2) separate heads
         q = self._separate_heads(q, self.num_heads)
         k = self._separate_heads(k, self.num_heads)
         v = self._separate_heads(v, self.num_heads)
 
+        # 3) Possibly apply Flash / fallback
         dropout_p = self.dropout_p if self.training else 0.0
-        # Attention
-        out = F.scaled_dot_product_attention(q, k, v, dropout_p=dropout_p)
+        try:
+            with sdp_kernel_context(dropout_p):
+                out = F.scaled_dot_product_attention(q, k, v, dropout_p=dropout_p)
+        except Exception:
+            global ALLOW_ALL_KERNELS
+            ALLOW_ALL_KERNELS = True
+            # fallback to normal
+            out = F.scaled_dot_product_attention(q, k, v, dropout_p=dropout_p)
 
+        # 4) recombine heads, final linear
         out = self._recombine_heads(out)
         out = self.out_proj(out)
-
         return out
 
 
 class RoPEAttention(Attention):
-    """Attention with rotary position encoding."""
-
+    """
+    A specialized Attention that uses rotary position encoding
+    (via either complex multiply or matrix-based real multiply).
+    """
     def __init__(
         self,
         *args,
         rope_theta=10000.0,
-        # whether to repeat q rope to match k length
-        # this is needed for cross-attention to memories
         rope_k_repeat=False,
-        feat_sizes=(64, 64),  # [w, h] for stride 16 feats at 1024 resolution
+        feat_sizes=(64, 64),  # typical [width, height]
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
-
-        self.compute_cis = partial(
-            compute_axial_cis, dim=self.internal_dim // self.num_heads, theta=rope_theta
-        )
-        freqs_cis = self.compute_cis(end_x=feat_sizes[0], end_y=feat_sizes[1])
-        self.freqs_cis = (
-            freqs_cis.to("cuda") if torch.cuda.is_available() else freqs_cis
-        )
         self.rope_k_repeat = rope_k_repeat
 
+        # Build the standard "complex" approach:
+        self.compute_cis = partial(
+            compute_axial_cis,
+            dim=self.internal_dim // self.num_heads,
+            theta=rope_theta,
+        )
+        freqs_cis = self.compute_cis(end_x=feat_sizes[0], end_y=feat_sizes[1])
+        self.freqs_cis = freqs_cis
+
+        # If you want the matrix-based approach:
+        global USE_MAT_ROTARY_ENC
+        self.use_matrix = USE_MAT_ROTARY_ENC
+        if self.use_matrix:
+            # build a real rotation matrix once
+            rotmats = get_rotation_matrices(
+                dim=self.internal_dim // self.num_heads,
+                end_x=feat_sizes[0],
+                end_y=feat_sizes[1],
+                theta=rope_theta,
+            )
+            self.rotmats = rotmats
+            self.rope_theta = rope_theta
+
     def forward(
-        self, q: Tensor, k: Tensor, v: Tensor, num_k_exclude_rope: int = 0
+        self,
+        q: Tensor,
+        k: Tensor,
+        v: Tensor,
+        num_k_exclude_rope: int = 0
     ) -> Tensor:
-        # Input projections
+        # 1) project Q, K, V
         q = self.q_proj(q)
         k = self.k_proj(k)
         v = self.v_proj(v)
 
-        # Separate into heads
+        # 2) separate heads
         q = self._separate_heads(q, self.num_heads)
         k = self._separate_heads(k, self.num_heads)
         v = self._separate_heads(v, self.num_heads)
 
-        # Apply rotary position encoding
-        w = h = math.sqrt(q.shape[-2])
+        # 3) apply rotary position encoding
+        seq_len = q.shape[-2]
+        w = h = math.isqrt(seq_len)  # or int(math.sqrt(seq_len))
+
+        # Rebuild freq or rotation if needed
         self.freqs_cis = self.freqs_cis.to(q.device)
-        if self.freqs_cis.shape[0] != q.shape[-2]:
+        if self.freqs_cis.shape[0] != seq_len:
             self.freqs_cis = self.compute_cis(end_x=w, end_y=h).to(q.device)
-        if q.shape[-2] != k.shape[-2]:
-            assert self.rope_k_repeat
 
+        if self.use_matrix:
+            self.rotmats = self.rotmats.to(q.device)
+            if self.rotmats.shape[0] != seq_len:
+                self.rotmats = get_rotation_matrices(
+                    dim=self.internal_dim // self.num_heads,
+                    end_x=w,
+                    end_y=h,
+                    theta=self.rope_theta,
+                ).to(q.device)
+
+        # Possibly exclude some positions from rope, e.g. cross-attn
         num_k_rope = k.size(-2) - num_k_exclude_rope
-        q, k[:, :, :num_k_rope] = apply_rotary_enc(
-            q,
-            k[:, :, :num_k_rope],
-            freqs_cis=self.freqs_cis,
-            repeat_freqs_k=self.rope_k_repeat,
-        )
+        if self.use_matrix:
+            # matrix-based approach
+            q, k[:, :, :num_k_rope] = apply_rotary_matenc(
+                q,
+                k[:, :, :num_k_rope],
+                rotmats=self.rotmats,
+                repeat_freqs_k=self.rope_k_repeat,
+            )
+        else:
+            # complex-based approach
+            q, k[:, :, :num_k_rope] = apply_rotary_enc(
+                q,
+                k[:, :, :num_k_rope],
+                freqs_cis=self.freqs_cis,
+                repeat_freqs_k=self.rope_k_repeat,
+            )
 
+        # 4) scaled-dot-product attention w/ fallback
         dropout_p = self.dropout_p if self.training else 0.0
-        # Attention
-        out = F.scaled_dot_product_attention(q, k, v, dropout_p=dropout_p)
+        try:
+            with sdp_kernel_context(dropout_p):
+                out = F.scaled_dot_product_attention(q, k, v, dropout_p=dropout_p)
+        except Exception:
+            global ALLOW_ALL_KERNELS
+            ALLOW_ALL_KERNELS = True
+            out = F.scaled_dot_product_attention(q, k, v, dropout_p=dropout_p)
 
         out = self._recombine_heads(out)
         out = self.out_proj(out)
-
         return out
